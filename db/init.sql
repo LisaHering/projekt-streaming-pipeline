@@ -1,5 +1,4 @@
-CREATE TABLE raw_trips (
-    trip_id             INTEGER PRIMARY KEY, 
+CREATE TABLE raw_trips ( 
     pickup_datetime     TIMESTAMP, 
     dropoff_datetime    TIMESTAMP, 
     pickup_zone         INTEGER, 
