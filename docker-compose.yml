@@ -35,5 +35,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+  producer:
+    build:
+      context: .
+      dockerfile: src/producer/Dockerfile
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
 volumes:
   postgres_data:
