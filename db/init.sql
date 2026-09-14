@@ -7,3 +7,10 @@ CREATE TABLE raw_trips (
     total_amount        NUMERIC, 
     trip_distance       NUMERIC
 ); 
+
+CREATE TABLE zones ( 
+    location_id         INTEGER PRIMARY KEY, 
+    borough             TEXT, 
+    zone                TEXT, 
+    service_zone        TEXT
+);
