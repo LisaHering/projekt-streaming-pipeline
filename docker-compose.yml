@@ -43,5 +43,15 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+  processing:
+    build:
+      context: .
+      dockerfile: src/processing/Dockerfile
+    container_name: processing
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 volumes:
   postgres_data:
