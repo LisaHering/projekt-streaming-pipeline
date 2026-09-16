@@ -3,6 +3,8 @@ import json
 import time
 import psycopg2
 
+speed_factor = 600
+
 # connect to Kafka broker
 producer = KafkaProducer(
     bootstrap_servers='kafka:9092',
@@ -22,37 +24,57 @@ cursor.execute("""
     SELECT pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, passenger_count, trip_distance, total_amount
     FROM raw_trips
     ORDER BY pickup_datetime
-    LIMIT 5
+    LIMIT 500
 """)
 trips = cursor.fetchall()
+cursor.close()
+connection.close()
 
+events = []
 trip_id = 0
 for trip in trips:
     trip_id += 1
-    pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, passenger_count, trip_distance, total_amount = trip
+    pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, \
+        passenger_count, trip_distance, total_amount = trip
 
-    pickup_event = {
-        "trip_id": trip_id,
-        "event_type": "pickup",
-        "pickup_datetime": pickup_datetime.isoformat(),
-        "pickup_zone": pickup_zone,
-        "passenger_count": passenger_count
-    }
+    events.append({
+        "sort_time": pickup_datetime,
+        "topic": "pickup_events",
+        "data": {
+            "trip_id": trip_id,
+            "event_type": "pickup",
+            "pickup_datetime": pickup_datetime.isoformat(),
+            "pickup_zone": pickup_zone,
+            "passenger_count": passenger_count
+        }
+    })
 
-    dropoff_event = {
-        "trip_id": trip_id,
-        "event_type": "dropoff",
-        "dropoff_datetime": dropoff_datetime.isoformat(),
-        "dropoff_zone": dropoff_zone,
-        "trip_distance": float(trip_distance),
-        "total_amount": float(total_amount)
-    }
+    events.append({
+        "sort_time": dropoff_datetime,
+        "topic": "dropoff_events",
+        "data": {
+            "trip_id": trip_id,
+            "event_type": "dropoff",
+            "dropoff_datetime": dropoff_datetime.isoformat(),
+            "dropoff_zone": dropoff_zone,
+            "trip_distance": float(trip_distance),
+            "total_amount": float(total_amount)
+        }
+    })
 
-    producer.send("pickup_events", pickup_event)
-    producer.send("dropoff_events", dropoff_event)
-    producer.flush()
+events.sort(key=lambda e: e["sort_time"])
 
+previous_time = None
+for e in events:
+    if previous_time is not None:
+        gap_seconds = (e["sort_time"] - previous_time).total_seconds()
+        wait = gap_seconds / speed_factor
+        wait = min(wait, 5.0)
+        if wait > 0:
+            time.sleep(wait)
+    producer.send(e["topic"], e["data"])
+    previous_time = e["sort_time"]
+    print(f"{e['sort_time']} -> {e['topic']} trip {e['data']['trip_id']}")
+
+producer.flush()
 print("All events sent to Kafka.")
-
-cursor.close()
-connection.close()
