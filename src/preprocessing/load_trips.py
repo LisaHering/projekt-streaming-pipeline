@@ -1,9 +1,9 @@
 import pandas as pd
 import psycopg2
 
-csv_path = "/Users/lisa/Dokumente/nyc_taxi_2022_01/nyc_taxi_2022_01_woche_1.csv"
+csv_path = "/Users/lisa/Dokumente/nyc_taxi_2022_01/nyc_taxi_2022_01_woche_3.csv"
 chunk_size = 50000
-max_rows = 5000
+max_rows = 200000
 
 connection = psycopg2.connect(
     host="localhost",

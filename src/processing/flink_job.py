@@ -1,8 +1,20 @@
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common import WatermarkStrategy
+from pyflink.common import WatermarkStrategy, Duration
+from pyflink.common.watermark_strategy import TimestampAssigner
+from datetime import datetime
 import json
+
+class PickupTimestampAssigner(TimestampAssigner):
+    def extract_timestamp(self, event, record_timestamp):
+        dt = datetime.fromisoformat(event["pickup_datetime"])
+        return int(dt.timestamp() * 1000)
+
+class DropoffTimestampAssigner(TimestampAssigner):
+    def extract_timestamp(self, event, record_timestamp):
+        dt = datetime.fromisoformat(event["dropoff_datetime"])
+        return int(dt.timestamp() * 1000)
 
 env = StreamExecutionEnvironment.get_execution_environment()
 env.set_parallelism(1)
@@ -22,8 +34,14 @@ pickup_stream = env.from_source(
 )
 
 parsed_pickups = pickup_stream.map(lambda text: json.loads(text))
-parsed_pickups \
-    .map(lambda event: f"PICKUP trip {event['trip_id']} in zone {event['pickup_zone']}") \
+
+pickups_with_time = parsed_pickups.assign_timestamps_and_watermarks(
+    WatermarkStrategy
+        .for_bounded_out_of_orderness(Duration.of_seconds(30))
+        .with_timestamp_assigner(PickupTimestampAssigner())
+)     
+pickups_with_time \
+    .map(lambda event: f"PICKUP trip {event['trip_id']} at {event['pickup_datetime']}") \
     .print()
 
 dropoff_source = KafkaSource.builder() \
@@ -41,8 +59,14 @@ dropoff_stream = env.from_source(
 )
 
 parsed_dropoffs = dropoff_stream.map(lambda text: json.loads(text))
-parsed_dropoffs \
-    .map(lambda event: f"DROPOFF trip {event['trip_id']} in zone {event['dropoff_zone']}, price: ${event['total_amount']}") \
+
+dropoffs_with_time = parsed_dropoffs.assign_timestamps_and_watermarks(
+    WatermarkStrategy
+        .for_bounded_out_of_orderness(Duration.of_seconds(30))
+        .with_timestamp_assigner(DropoffTimestampAssigner())
+)
+dropoffs_with_time \
+    .map(lambda event: f"DROPOFF trip {event['trip_id']} at {event['dropoff_datetime']}, price: ${event['total_amount']}") \
     .print()
 
 env.execute("Taxi Flink Streaming Job")
