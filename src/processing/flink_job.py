@@ -1,13 +1,14 @@
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeContext
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
-from pyflink.datastream.functions import KeyedCoProcessFunction
+from pyflink.datastream.functions import KeyedCoProcessFunction, MapFunction
 from pyflink.datastream.state import ValueStateDescriptor
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common import WatermarkStrategy, Duration, Time
+from pyflink.common import WatermarkStrategy, Duration
 from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.common.typeinfo import Types
 from datetime import datetime
 import json
+import psycopg2
 
 class PickupTimestampAssigner(TimestampAssigner):
     def extract_timestamp(self, event, record_timestamp):
@@ -21,6 +22,8 @@ class DropoffTimestampAssigner(TimestampAssigner):
 
 env = StreamExecutionEnvironment.get_execution_environment()
 env.set_parallelism(1)
+
+# --- KAFKA SOURCES & STREAMS ---
 
 pickup_source = KafkaSource.builder() \
     .set_bootstrap_servers("kafka:9092") \
@@ -43,9 +46,6 @@ pickups_with_time = parsed_pickups.assign_timestamps_and_watermarks(
         .for_bounded_out_of_orderness(Duration.of_seconds(30))
         .with_timestamp_assigner(PickupTimestampAssigner())
 )     
-#pickups_with_time \
-#    .map(lambda event: f"PICKUP trip {event['trip_id']} at {event['pickup_datetime']}") \
-#    .print()
 
 dropoff_source = KafkaSource.builder() \
     .set_bootstrap_servers("kafka:9092") \
@@ -68,9 +68,8 @@ dropoffs_with_time = parsed_dropoffs.assign_timestamps_and_watermarks(
         .for_bounded_out_of_orderness(Duration.of_seconds(30))
         .with_timestamp_assigner(DropoffTimestampAssigner())
 )
-#dropoffs_with_time \
-#    .map(lambda event: f"DROPOFF trip {event['trip_id']} at {event['dropoff_datetime']}, price: ${event['total_amount']}") \
-#    .print()
+
+# --- JOIN FUNCTION ---
 
 MAX_DURATION_SECONDS = 60 * 60 * 3
 
@@ -120,6 +119,39 @@ class JoinTripsFunction(KeyedCoProcessFunction):
             "is_valid": is_valid
         }
 
+# --- POSTGRES SINK FUNCTION ---
+
+class PostgresSinkFunction(MapFunction):
+    def open(self, runtime_context):
+        self.connection = psycopg2.connect(
+            host="postgres",
+            port=5432,
+            dbname="taxi",
+            user="taxi_user",   
+            password="taxi_pass"
+        )
+        self.cursor = self.connection.cursor()
+
+    def map(self, row):
+        self.cursor.execute(
+            """INSERT INTO invalid_trips 
+                (trip_id, pickup_zone, dropoff_zone, pickup_datetime, dropoff_datetime, 
+                duration_seconds, trip_distance, passenger_count, total_amount)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (row["trip_id"], row["pickup_zone"], row["dropoff_zone"], row["pickup_datetime"], row["dropoff_datetime"], 
+            row["duration_seconds"], row["trip_distance"], row["passenger_count"], row["total_amount"])
+        )
+        self.connection.commit()
+        return row
+
+    def close(self):
+        if hasattr(self, 'cursor') and self.cursor:
+            self.cursor.close()
+        if hasattr(self, 'connection') and self.connection:
+            self.connection.close()
+
+# --- STREAM CONNECTION & EXECUTION ---
+
 joined_trips = pickups_with_time.key_by(lambda event: event["trip_id"]) \
     .connect(dropoffs_with_time.key_by(lambda event: event["trip_id"])) \
     .process(JoinTripsFunction())
@@ -130,5 +162,9 @@ joined_trips \
                         f"took {trip['duration_seconds']/60:.1f} min for {trip['trip_distance']} miles " 
                         f"passengers: {trip['passenger_count']}, total amount: ${trip['total_amount']}") \
     .print()
+
+joined_trips \
+    .filter(lambda trip: not trip["is_valid"]) \
+    .map(PostgresSinkFunction())
 
 env.execute("Taxi Flink Streaming Job")
