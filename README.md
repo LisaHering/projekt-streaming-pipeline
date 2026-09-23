@@ -4,3 +4,6 @@ Microservice-Architektur für die Stream-Prozessierung von Taxi-Daten mit Kafka,
 
 ## Projektbeschreibung
 Streaming-Pipeline mit Kafka, Flink und PostgreSQL (IU-Projekt DLMDWWDE02).
+
+
+Vor dem Start .env.example zu .env kopieren und Passwort eintragen.

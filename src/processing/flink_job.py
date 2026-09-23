@@ -9,6 +9,7 @@ from pyflink.common.typeinfo import Types
 from datetime import datetime
 import json
 import psycopg2
+import os
 
 class PickupTimestampAssigner(TimestampAssigner):
     def extract_timestamp(self, event, record_timestamp):
@@ -22,6 +23,7 @@ class DropoffTimestampAssigner(TimestampAssigner):
 
 env = StreamExecutionEnvironment.get_execution_environment()
 env.set_parallelism(1)
+env.enable_checkpointing(60_000)
 
 # --- KAFKA SOURCES & STREAMS ---
 
@@ -72,6 +74,7 @@ dropoffs_with_time = parsed_dropoffs.assign_timestamps_and_watermarks(
 # --- JOIN FUNCTION ---
 
 MAX_DURATION_SECONDS = 60 * 60 * 3
+TIMEOUT_SECONDS = 60 * 60 * 48
 
 class JoinTripsFunction(KeyedCoProcessFunction):
     def open(self, runtime_context: RuntimeContext):
@@ -91,6 +94,7 @@ class JoinTripsFunction(KeyedCoProcessFunction):
             self.dropoff_state.clear()
         else:
             self.pickup_state.update(json.dumps(pickup))
+            ctx.timer_service().register_event_time_timer(ctx.timestamp() + TIMEOUT_SECONDS * 1000)
 
     def process_element2(self, dropoff, ctx):
         pickup_json = self.pickup_state.value()
@@ -100,6 +104,17 @@ class JoinTripsFunction(KeyedCoProcessFunction):
             self.pickup_state.clear()
         else:
             self.dropoff_state.update(json.dumps(dropoff))
+            ctx.timer_service().register_event_time_timer(ctx.timestamp() + TIMEOUT_SECONDS * 1000)
+
+    def on_timer(self, timestamp, ctx):
+        pickup_json = self.pickup_state.value()
+        if pickup_json is not None:
+            yield self._build_orphan(json.loads(pickup_json))
+            self.pickup_state.clear()
+        dropoff_json = self.dropoff_state.value()
+        if dropoff_json is not None:
+            yield self._build_orphan(json.loads(dropoff_json))
+            self.dropoff_state.clear()    
 
     def _build_trip(self, pickup, dropoff):
         pickup_dt = datetime.fromisoformat(pickup["pickup_datetime"])
@@ -119,6 +134,20 @@ class JoinTripsFunction(KeyedCoProcessFunction):
             "is_valid": is_valid
         }
 
+    def _build_orphan(self, event):
+        return{
+            "trip_id": event["trip_id"],
+            "pickup_zone": event.get("pickup_zone"),
+            "dropoff_zone": event.get("dropoff_zone"),
+            "pickup_datetime": event.get("pickup_datetime"),
+            "dropoff_datetime": event.get("dropoff_datetime"),
+            "duration_seconds": None,
+            "trip_distance": event.get("trip_distance"),
+            "passenger_count": event.get("passenger_count"),
+            "total_amount": event.get("total_amount"),
+            "is_valid": False
+        }
+
 # --- POSTGRES SINK FUNCTION ---
 
 class PostgresSinkFunction(MapFunction):
@@ -128,7 +157,7 @@ class PostgresSinkFunction(MapFunction):
             port=5432,
             dbname="taxi",
             user="taxi_user",   
-            password="taxi_pass"
+            password=os.getenv("DB_PASSWORD")
         )
         self.cursor = self.connection.cursor()
 
@@ -137,7 +166,8 @@ class PostgresSinkFunction(MapFunction):
             """INSERT INTO invalid_trips 
                 (trip_id, pickup_zone, dropoff_zone, pickup_datetime, dropoff_datetime, 
                 duration_seconds, trip_distance, passenger_count, total_amount)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (trip_id) DO NOTHING""",
             (row["trip_id"], row["pickup_zone"], row["dropoff_zone"], row["pickup_datetime"], row["dropoff_datetime"], 
             row["duration_seconds"], row["trip_distance"], row["passenger_count"], row["total_amount"])
         )
@@ -159,7 +189,8 @@ joined_trips = pickups_with_time.key_by(lambda event: event["trip_id"]) \
 joined_trips \
     .map(lambda trip:   f"{'VALID' if trip['is_valid'] else 'INVALID'} "
                         f"Trip {trip['trip_id']} from {trip['pickup_zone']} to {trip['dropoff_zone']} " 
-                        f"took {trip['duration_seconds']/60:.1f} min for {trip['trip_distance']} miles " 
+                        f"took {trip['duration_seconds']/60 if trip['duration_seconds'] is not None else 'n/a'} min "
+                        f"for {trip['trip_distance']} miles " 
                         f"passengers: {trip['passenger_count']}, total amount: ${trip['total_amount']}") \
     .print()
 

@@ -23,7 +23,7 @@ services:
     container_name: postgres
     environment:
       POSTGRES_USER: taxi_user
-      POSTGRES_PASSWORD: taxi_pass
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: taxi
     ports:
       - "5432:5432"
@@ -43,6 +43,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD}
   processing:
     build:
       context: .
@@ -53,5 +55,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD}
+    restart: on-failure
 volumes:
   postgres_data:

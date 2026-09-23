@@ -2,6 +2,7 @@ from kafka import KafkaProducer
 import json
 import time
 import psycopg2
+import os
 
 speed_factor = 600
 
@@ -16,7 +17,7 @@ connection = psycopg2.connect(
     port=5432,
     dbname="taxi",
     user="taxi_user",   
-    password="taxi_pass"
+    password=os.getenv("DB_PASSWORD")
 )
 cursor = connection.cursor()
 

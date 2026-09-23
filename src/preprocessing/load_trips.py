@@ -1,7 +1,10 @@
 import pandas as pd
 import psycopg2
+import os
+from dotenv import load_dotenv
 
 csv_path = "/Users/lisa/Dokumente/nyc_taxi_2022_01/nyc_taxi_2022_01_woche_3.csv"
+load_dotenv()
 chunk_size = 50000
 max_rows = 200000
 
@@ -10,7 +13,7 @@ connection = psycopg2.connect(
     port=5432,
     dbname="taxi",
     user="taxi_user",   
-    password="taxi_pass"
+    password=os.getenv("DB_PASSWORD")
 )
 cursor = connection.cursor()
 

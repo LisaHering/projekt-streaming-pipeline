@@ -14,3 +14,15 @@ CREATE TABLE zones (
     zone                TEXT, 
     service_zone        TEXT
 );
+
+CREATE TABLE invalid_trips (
+    trip_id             INTEGER PRIMARY KEY,
+    pickup_datetime     TIMESTAMP,
+    dropoff_datetime    TIMESTAMP,
+    pickup_zone         INTEGER,
+    dropoff_zone        INTEGER,
+    passenger_count     INTEGER,
+    trip_distance       NUMERIC,
+    total_amount        NUMERIC,
+    duration_seconds    NUMERIC
+);

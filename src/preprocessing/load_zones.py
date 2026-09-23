@@ -1,8 +1,11 @@
 import pandas as pd
 import psycopg2
+import os
+from dotenv import load_dotenv
 
 csv_path = "/Users/lisa/Dokumente/nyc_taxi_2022_01/taxi_zone_lookup.csv"
 zones = pd.read_csv(csv_path)
+load_dotenv()
 
 zones = zones.rename(columns={
     "LocationID": "location_id",
@@ -16,7 +19,7 @@ connection = psycopg2.connect(
     port=5432,
     dbname="taxi",
     user="taxi_user",
-    password="taxi_pass"
+    password=os.getenv("DB_PASSWORD")
 )
 cursor = connection.cursor()
 
