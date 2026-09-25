@@ -18,6 +18,8 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    volumes:
+      - kafka_data:/tmp/kafka-logs
   postgres:
     image: postgres:16
     container_name: postgres
@@ -60,3 +62,4 @@ services:
     restart: on-failure
 volumes:
   postgres_data:
+  kafka_data:
