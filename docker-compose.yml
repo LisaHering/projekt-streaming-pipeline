@@ -1,7 +1,16 @@
 services:
+  kafka-init:
+    image: alpine
+    container_name: kafka-init
+    command: ["chown", "-R", "1000:1000", "/data"]
+    volumes:
+      - kafka_data:/data
   kafka:
     image: apache/kafka:3.9.0
     container_name: kafka
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s

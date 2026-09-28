@@ -25,7 +25,6 @@ cursor.execute("""
     SELECT pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, passenger_count, trip_distance, total_amount
     FROM raw_trips
     ORDER BY pickup_datetime
-    LIMIT 1000
 """)
 trips = cursor.fetchall()
 cursor.close()
