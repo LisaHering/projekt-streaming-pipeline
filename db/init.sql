@@ -33,5 +33,6 @@ CREATE TABLE aggregates (
     window_start        TIMESTAMP,
     window_end          TIMESTAMP NOT NULL,
     dimension           TEXT,
-    value               NUMERIC NOT NULL     
+    value               NUMERIC NOT NULL,     
+    UNIQUE (metric_name, window_start, window_end, dimension)
 );

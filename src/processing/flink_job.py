@@ -281,7 +281,9 @@ class AggregatesSinkFunction(MapFunction):
     def map(self, row):
         self.cursor.execute(
             """INSERT INTO aggregates (metric_name, window_start, window_end, dimension, value)
-                VALUES (%s, %s, %s, %s, %s)""",
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (metric_name, window_start, window_end, dimension)
+                DO UPDATE SET value = EXCLUDED.value""",
             (row["metric_name"], row["window_start"], row["window_end"], row["dimension"], row["value"])
         )
         self.connection.commit()

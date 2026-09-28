@@ -10,5 +10,6 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 COPY src/processing/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt 
 COPY src/processing/flink_job.py .
+RUN chmod 644 flink_job.py
 
 CMD ["python3", "flink_job.py"]
