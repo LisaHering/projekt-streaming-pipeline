@@ -1,6 +1,6 @@
-from pyflink.datastream import StreamExecutionEnvironment, RuntimeContext, ProcessWindowFunction, KeyedProcessFunction, OutputTag
+from pyflink.datastream import StreamExecutionEnvironment, RuntimeContext, ProcessWindowFunction, KeyedProcessFunction
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
-from pyflink.datastream.functions import KeyedCoProcessFunction, MapFunction
+from pyflink.datastream.functions import MapFunction, AggregateFunction
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.datastream.window import TumblingEventTimeWindows, SlidingEventTimeWindows
 from pyflink.common.serialization import SimpleStringSchema
@@ -24,7 +24,7 @@ class DropoffTimestampAssigner(TimestampAssigner):
 
 env = StreamExecutionEnvironment.get_execution_environment()
 env.set_parallelism(1)
-env.enable_checkpointing(60_000)
+# env.enable_checkpointing(60_000)
 
 # --- KAFKA SOURCES & STREAMS ---
 
@@ -76,9 +76,8 @@ dropoffs_with_time = parsed_dropoffs.assign_timestamps_and_watermarks(
 
 MAX_DURATION_SECONDS = 60 * 60 * 3
 TIMEOUT_SECONDS = 60 * 60 * 48
-LIFECYCLE_TAG = OutputTag("trip-lifecycle", Types.STRING())
 
-class JoinTripsFunction(KeyedCoProcessFunction):
+class JoinTripsFunction(KeyedProcessFunction):
     def open(self, runtime_context: RuntimeContext):
         pickup_desc = runtime_context.get_state(self._value_state_descriptor("pickup_state"))
         dropoff_desc = runtime_context.get_state(self._value_state_descriptor("dropoff_state"))
@@ -88,46 +87,54 @@ class JoinTripsFunction(KeyedCoProcessFunction):
     def _value_state_descriptor(self, name):
         return ValueStateDescriptor(name, Types.STRING())
 
-    def process_element1(self, pickup, ctx):
+    def process_element(self, event, ctx):
+        if event["event_type"] == "pickup":
+            yield from self._handle_pickup(event, ctx)
+        else:
+            yield from self._handle_dropoff(event, ctx)
+
+    def _handle_pickup(self, pickup, ctx):
+        yield {
+            "record_type": "lifecycle",
+            "signal": "pickup",
+            "trip_id": pickup["trip_id"],
+            "timestamp": ctx.timestamp()
+        }
+        self.pickup_state.update(json.dumps(pickup))
         dropoff_json = self.dropoff_state.value()
         if dropoff_json is not None:
-            dropoff = json.loads(dropoff_json)
-            yield self._build_trip(pickup, dropoff)
-            self.dropoff_state.clear()
+            dropoff_ms = int(datetime.fromisoformat(json.loads(dropoff_json)["dropoff_datetime"]).timestamp() * 1000)
+            ctx.timer_service().register_event_time_timer(dropoff_ms)
         else:
-            self.pickup_state.update(json.dumps(pickup))
             ctx.timer_service().register_event_time_timer(ctx.timestamp() + TIMEOUT_SECONDS * 1000)
-            ctx.output(LIFECYCLE_TAG, json.dumps({
-                 "signal": "open",
-                 "trip_id": pickup["trip_id"],
-                 "pickup_datetime": pickup["pickup_datetime"]
-                 }))
 
-    def process_element2(self, dropoff, ctx):
+    def _handle_dropoff(self, dropoff, ctx):
+        yield {
+            "record_type": "lifecycle",
+            "signal": "dropoff",
+            "trip_id": dropoff["trip_id"],
+            "timestamp": ctx.timestamp()
+        }
         pickup_json = self.pickup_state.value()
         if pickup_json is not None:
             pickup = json.loads(pickup_json)
             yield self._build_trip(pickup, dropoff)
             self.pickup_state.clear()
-            ctx.output(LIFECYCLE_TAG, json.dumps({
-                 "signal": "close",
-                 "trip_id": dropoff["trip_id"]
-            }))
         else:
             self.dropoff_state.update(json.dumps(dropoff))
             ctx.timer_service().register_event_time_timer(ctx.timestamp() + TIMEOUT_SECONDS * 1000)
 
     def on_timer(self, timestamp, ctx):
         pickup_json = self.pickup_state.value()
-        if pickup_json is not None:
-            pickup = json.loads(pickup_json)
-            yield self._build_orphan(pickup)
-            self.pickup_state.clear()
-            ctx.output(LIFECYCLE_TAG, json.dumps({
-                 "signal": "close",
-                 "trip_id": pickup["trip_id"]
-            }))
         dropoff_json = self.dropoff_state.value()
+        if pickup_json is not None and dropoff_json is not None:
+            yield self._build_trip(json.loads(pickup_json), json.loads(dropoff_json))
+            self.pickup_state.clear()
+            self.dropoff_state.clear()
+            return
+        if pickup_json is not None:
+            yield self._build_orphan(json.loads(pickup_json))
+            self.pickup_state.clear()
         if dropoff_json is not None:
             yield self._build_orphan(json.loads(dropoff_json))
             self.dropoff_state.clear()
@@ -138,6 +145,7 @@ class JoinTripsFunction(KeyedCoProcessFunction):
         duration_seconds = (dropoff_dt - pickup_dt).total_seconds()
         is_valid = 0 < duration_seconds <= MAX_DURATION_SECONDS
         return {
+            "record_type": "trip",
             "trip_id": pickup["trip_id"],
             "pickup_zone": pickup["pickup_zone"],
             "dropoff_zone": dropoff["dropoff_zone"],
@@ -152,6 +160,7 @@ class JoinTripsFunction(KeyedCoProcessFunction):
 
     def _build_orphan(self, event):
         return{
+            "record_type": "trip",
             "trip_id": event["trip_id"],
             "pickup_zone": event.get("pickup_zone"),
             "dropoff_zone": event.get("dropoff_zone"),
@@ -163,7 +172,24 @@ class JoinTripsFunction(KeyedCoProcessFunction):
             "total_amount": event.get("total_amount"),
             "is_valid": False
         }
+# --- INCREMENTAL AGGREGATION ---
 
+class TripStatsAggregate(AggregateFunction):
+    def create_accumulator(self):
+        return(0, 0.0, 0.0, 0.0)
+    
+    def add(self, trip, acc):
+        return (acc[0] + 1,
+                acc[1] + trip["passenger_count"],
+                acc[2] + trip["trip_distance"],
+                acc[3] + trip["total_amount"])
+    
+    def get_result(self, acc):
+        return acc
+    
+    def merge(self, a, b):
+        return (a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3])
+    
 # --- AGGREGATION 1: STATISTICS BY BOROUGHS ---
 
 class EnrichBoroughFunction(MapFunction):
@@ -180,24 +206,25 @@ class EnrichBoroughFunction(MapFunction):
         self.borough_by_zone = dict(cursor.fetchall())
         cursor.close()
 
+    def close(self):
+        if hasattr(self, 'connection') and self.connection:
+            self.connection.close()
+
     def map(self, row):
         row["dropoff_borough"] = self.borough_by_zone.get(row["dropoff_zone"], "Unknown")
         return row
 
 class BoroughStatsFunction(ProcessWindowFunction):
     def process(self, key, context, elements):
-        elements = list(elements)
-        count = len(elements)
-        avg_passengers = sum(event["passenger_count"] for event in elements) / count
-        avg_distance = sum(event["trip_distance"] for event in elements) / count
+        count, passengers, distance, revenue = next(iter(elements))
         window_start = datetime.fromtimestamp(context.window().start / 1000)
         window_end = datetime.fromtimestamp(context.window().end / 1000)
         yield {"metric_name": "trip_count_by_borough", "window_start": window_start,
                "window_end": window_end, "dimension": key, "value": count}
         yield {"metric_name": "avg_passengers_by_borough", "window_start": window_start,
-               "window_end": window_end, "dimension": key, "value": avg_passengers}
+               "window_end": window_end, "dimension": key, "value": passengers / count}
         yield {"metric_name": "avg_distance_by_borough", "window_start": window_start,
-               "window_end": window_end, "dimension": key, "value": avg_distance}
+               "window_end": window_end, "dimension": key, "value": distance / count}
 
 # --- AGGREGATION 2: STATISTICS BY TIME OF DAY ---
 
@@ -216,18 +243,15 @@ def dropoff_time_to_time_of_day(dt):
 
 class TimeOfDayStatsFunction(ProcessWindowFunction):        
     def process(self, key, context, elements):
-        elements = list(elements)
-        count = len(elements)
-        avg_passengers = sum(event["passenger_count"] for event in elements) / count
-        avg_distance = sum(event["trip_distance"] for event in elements) / count
+        count, passengers, distance, revenue = next(iter(elements))
         window_start = datetime.fromtimestamp(context.window().start / 1000)
         window_end = datetime.fromtimestamp(context.window().end / 1000)
         yield {"metric_name": "trip_count_by_time_of_day", "window_start": window_start,
                "window_end": window_end, "dimension": key, "value": count}
         yield {"metric_name": "avg_passengers_by_time_of_day", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": avg_passengers}
+                "window_end": window_end, "dimension": key, "value": passengers / count}
         yield {"metric_name": "avg_distance_by_time_of_day", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": avg_distance}
+                "window_end": window_end, "dimension": key, "value": distance / count}
 
 # --- AGGREGATION 3: WEEKLY TRIPS & REVENUE ---
 
@@ -237,17 +261,14 @@ def dropoff_time_to_week(dt):
 
 class WeeklyStatsFunction(ProcessWindowFunction):
      def process(self, key, context, elements):
-         elements = list(elements)
-         count = len(elements)
-         total_revenue = sum(event["total_amount"] for event in elements)
-         total_distance = sum(event["trip_distance"] for event in elements)
-         revenue_per_mile = total_revenue / total_distance if total_distance > 0 else 0
+         count, passengers, distance, revenue = next(iter(elements))
+         revenue_per_mile = revenue / distance if distance > 0 else 0
          window_start = datetime.fromtimestamp(context.window().start / 1000)
          window_end = datetime.fromtimestamp(context.window().end / 1000)
          yield {"metric_name": "trips_per_week", "window_start": window_start,
                 "window_end": window_end, "dimension": key, "value": count}
          yield {"metric_name": "revenue_by_week", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": total_revenue}
+                "window_end": window_end, "dimension": key, "value": revenue}
          yield {"metric_name": "revenue_per_mile_by_week", "window_start": window_start,
                 "window_end": window_end, "dimension": key, "value": revenue_per_mile}
 
@@ -255,18 +276,13 @@ class WeeklyStatsFunction(ProcessWindowFunction):
 
 class LastHourMovingFunction(ProcessWindowFunction):
      def process(self, key, context, elements):
-         elements = list(elements)
-         count = len(elements)
-         if not elements:
-             return
-         avg_price = sum(event["total_amount"] for event in elements) / count
-         total_revenue = sum(event["total_amount"] for event in elements)
+         count, passengers, distance, revenue = next(iter(elements))
          window_start = datetime.fromtimestamp(context.window().start / 1000)
          window_end = datetime.fromtimestamp(context.window().end / 1000)
          yield {"metric_name": "avg_price_last_h", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": avg_price}
+                "window_end": window_end, "dimension": key, "value": revenue / count}
          yield {"metric_name": "revenue_last_h", "window_start": window_start,
-                         "window_end": window_end, "dimension": key, "value": total_revenue}
+                         "window_end": window_end, "dimension": key, "value": revenue}
          yield {"metric_name": "trips_last_h", "window_start": window_start,
                          "window_end": window_end, "dimension": key, "value": count}
 
@@ -276,20 +292,22 @@ GAUGE_WINDOW_SECONDS = MAX_DURATION_SECONDS
 
 class OpenTripsGaugeFunction(KeyedProcessFunction):
     def open(self, runtime_context):
-        self.open_trips = runtime_context.get_map_state(
-            MapStateDescriptor("open_trips", Types.STRING(), Types.LONG())
+        self.pickups = runtime_context.get_map_state(
+            MapStateDescriptor("gauge_pickups", Types.STRING(), Types.LONG())
+        )
+        self.dropoffs = runtime_context.get_map_state(
+            MapStateDescriptor("gauge_dropoffs", Types.STRING(), Types.LONG())
         )
         self.timer_registered = runtime_context.get_state(
             ValueStateDescriptor("gauge_timer_registered", Types.BOOLEAN())
         )
 
     def process_element(self, value, ctx):
-        signal = json.loads(value)
-        if signal["signal"] == "open":
-            pickup_ms = int(datetime.fromisoformat(signal["pickup_datetime"]).timestamp() * 1000)
-            self.open_trips.put(str(signal["trip_id"]), pickup_ms)
-        elif signal["signal"] == "close":
-            self.open_trips.remove(str(signal["trip_id"]))
+        trip_id = str(value["trip_id"])
+        if value["signal"] == "pickup":
+            self.pickups.put(trip_id, value["timestamp"])
+        else:
+            self.dropoffs.put(trip_id, value["timestamp"])
 
         if self.timer_registered.value() is None:
             now = ctx.timer_service().current_processing_time()
@@ -297,20 +315,35 @@ class OpenTripsGaugeFunction(KeyedProcessFunction):
             self.timer_registered.update(True)
 
     def on_timer(self, timestamp, ctx):
-        cutoff = timestamp - GAUGE_WINDOW_SECONDS * 1000
-        stale = [trip_id for trip_id, pickup_ms in self.open_trips.items() if pickup_ms < cutoff]
-        for trip_id in stale:
-            self.open_trips.remove(trip_id)
+        ctx.timer_service().register_processing_time_timer(timestamp + 60000)
+        event_now = ctx.timer_service().current_watermark()
+        if event_now <= 0:
+            return
+                
+        cutoff = event_now - GAUGE_WINDOW_SECONDS * 1000
+        count = 0
+        finished = []
+        for trip_id , pickup_ms in list(self.pickups.items()):
+            dropoff_ms = self.dropoffs.get(trip_id)
+            if (dropoff_ms is not None and dropoff_ms <= event_now) or pickup_ms < cutoff:
+                finished.append(trip_id)
+            elif pickup_ms <= event_now:
+                count += 1
+        for trip_id in finished:
+            self.pickups.remove(trip_id)
+            self.dropoffs.remove(trip_id)
 
-        count = sum(1 for _ in self.open_trips.items())
+        stale_dropoffs = [trip_id for trip_id, dropoff_ms in self.dropoffs.items() if dropoff_ms < cutoff]
+        for trip_id in stale_dropoffs:
+            self.dropoffs.remove(trip_id)
+       
         yield {
             "metric_name": "open_trips",
-            "window_start": None,
-            "window_end": datetime.fromtimestamp(timestamp / 1000),
-            "dimension": None,
+            "window_start": datetime.fromtimestamp(cutoff / 1000),
+            "window_end": datetime.fromtimestamp(event_now / 1000),
+            "dimension": "all",
             "value": count
         }
-        ctx.timer_service().register_processing_time_timer(timestamp + 60_000)
 
 # --- POSTGRES SINK FUNCTIONS ---
 
@@ -374,50 +407,49 @@ class AggregatesSinkFunction(MapFunction):
 
 # --- STREAM CONNECTION & EXECUTION ---
 
-joined_trips = pickups_with_time.key_by(lambda event: event["trip_id"]) \
-    .connect(dropoffs_with_time.key_by(lambda event: event["trip_id"])) \
+joined_trips = pickups_with_time.union(dropoffs_with_time) \
+    .key_by(lambda event: event["trip_id"]) \
     .process(JoinTripsFunction())
 
-joined_trips \
-    .map(lambda trip:   f"{'VALID' if trip['is_valid'] else 'INVALID'} "
-                        f"Trip {trip['trip_id']} from {trip['pickup_zone']} to {trip['dropoff_zone']} "
-                        f"took {trip['duration_seconds']/60 if trip['duration_seconds'] is not None else 'n/a'} min "
-                        f"for {trip['trip_distance']} miles "
-                        f"passengers: {trip['passenger_count']}, total amount: ${trip['total_amount']}") \
+trips_only = joined_trips.filter(lambda r: r["record_type"] == "trip")
+lifecycle_signals = joined_trips.filter(lambda r: r["record_type"] == "lifecycle")
+
+trips_only.map(lambda trip:   f"{'VALID' if trip['is_valid'] else 'INVALID'} "
+    f"Trip {trip['trip_id']} from {trip['pickup_zone']} to {trip['dropoff_zone']} "
+    f"took {trip['duration_seconds']/60 if trip['duration_seconds'] is not None else 'n/a'} min "
+    f"for {trip['trip_distance']} miles "
+    f"passengers: {trip['passenger_count']}, total amount: ${trip['total_amount']}") \
     .print()
 
-joined_trips \
-    .filter(lambda trip: not trip["is_valid"]) \
+trips_only.filter(lambda trip: not trip["is_valid"]) \
     .map(InvalidsSinkFunction())
 
-enriched_trips = joined_trips \
-    .filter(lambda trip: trip["is_valid"]) \
+enriched_trips = trips_only.filter(lambda trip: trip["is_valid"]) \
     .map(EnrichBoroughFunction()) \
     .map(lambda trip: {**trip, "time_of_day": dropoff_time_to_time_of_day(datetime.fromisoformat(trip["dropoff_datetime"]))})
 
 enriched_trips.key_by(lambda trip: trip["dropoff_borough"]) \
     .window(TumblingEventTimeWindows.of(Time.hours(24))) \
-    .process(BoroughStatsFunction()) \
+    .aggregate(TripStatsAggregate(), window_function=BoroughStatsFunction()) \
     .map(AggregatesSinkFunction())
 
 enriched_trips.key_by(lambda trip: trip["time_of_day"]) \
     .window(TumblingEventTimeWindows.of(Time.hours(24))) \
-    .process(TimeOfDayStatsFunction()) \
+    .aggregate(TripStatsAggregate(), window_function=TimeOfDayStatsFunction()) \
     .map(AggregatesSinkFunction())
 
 enriched_trips.key_by(lambda trip: dropoff_time_to_week(datetime.fromisoformat(trip["dropoff_datetime"]))) \
     .window(TumblingEventTimeWindows.of(Time.days(7), Time.days(4))) \
-    .process(WeeklyStatsFunction()) \
+    .aggregate(TripStatsAggregate(), window_function=WeeklyStatsFunction()) \
     .map(AggregatesSinkFunction())
 
 enriched_trips.key_by(lambda t: "all") \
-     .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(5))) \
-     .process(LastHourMovingFunction()) \
-     .map(AggregatesSinkFunction())
+    .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(5))) \
+    .aggregate(TripStatsAggregate(), window_function=LastHourMovingFunction()) \
+    .map(AggregatesSinkFunction())
 
-joined_trips.get_side_output(LIFECYCLE_TAG) \
-     .key_by(lambda x: "all") \
-     .process(OpenTripsGaugeFunction()) \
-     .map(AggregatesSinkFunction())
+lifecycle_signals.key_by(lambda x: "all") \
+    .process(OpenTripsGaugeFunction()) \
+    .map(AggregatesSinkFunction())
 
 env.execute("Taxi Flink Streaming Job")

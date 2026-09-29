@@ -48,7 +48,7 @@ for pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, \
     trip_id += 1
 
     while pending_dropoffs and pending_dropoffs[0][0] <= pickup_datetime:
-        dropoff_time, dropoff_data = heapq.heappop(pending_dropoffs)
+        dropoff_time, _, dropoff_data = heapq.heappop(pending_dropoffs)
         send_event("dropoff_events", dropoff_data, dropoff_time)
 
     send_event("pickup_events", {
@@ -59,7 +59,7 @@ for pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, \
         "passenger_count": passenger_count
     }, pickup_datetime)
 
-    heapq.heappush(pending_dropoffs, (dropoff_datetime, {
+    heapq.heappush(pending_dropoffs, (dropoff_datetime, trip_id, {
         "trip_id": trip_id,
         "event_type": "dropoff",
         "dropoff_datetime": dropoff_datetime.isoformat(),
@@ -69,7 +69,7 @@ for pickup_datetime, dropoff_datetime, pickup_zone, dropoff_zone, \
     }))
 
 while pending_dropoffs:
-    dropoff_time, dropoff_data = heapq.heappop(pending_dropoffs)
+    dropoff_time, _, dropoff_data = heapq.heappop(pending_dropoffs)
     send_event("dropoff_events", dropoff_data, dropoff_time)
 
 producer.flush()
