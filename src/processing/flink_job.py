@@ -13,77 +13,49 @@ import json
 import psycopg2
 import os
 
+# --- CONFIGURATION ---
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+PICKUP_TOPIC = os.getenv("PICKUP_TOPIC", "pickup_events")
+DROPOFF_TOPIC = os.getenv("DROPOFF_TOPIC", "dropoff_events")
+PARALLELISM = int(os.getenv("PARALLELISM", "1"))
+
+CHECKPOINT_INTERVAL_MS = int(os.getenv("CHECKPOINT_INTERVAL_MS", "0"))
+CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "file:///tmp/flink-checkpoints")
+
+OUT_OF_ORDERNESS_SECONDS = 30
+MAX_DURATION_SECONDS = 60 * 60 *3
+TIMEOUT_SECONDS = 60 * 60 * 48
+LAST_HOUR_SLIDE_MINUTES = 5
+
+def connect_db():
+    """Open new PostgreSQL connection with configurations."""
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "postgres"),
+        port=int(os.getenv("DB_PORT", "5432")),                  
+        dbname=os.getenv("DB_NAME", "taxi"),
+        user=os.getenv("DB_USER", "taxi_user"),
+        password=os.environ["DB_PASSWORD"],
+    )
+
+# --- EVENT TIME ---
+
 class PickupTimestampAssigner(TimestampAssigner):
+    """Use pickup time as event time."""
+
     def extract_timestamp(self, event, record_timestamp):
         dt = datetime.fromisoformat(event["pickup_datetime"])
         return int(dt.timestamp() * 1000)
 
 
 class DropoffTimestampAssigner(TimestampAssigner):
+    """Use dropoff time as event time."""
+
     def extract_timestamp(self, event, record_timestamp):
         dt = datetime.fromisoformat(event["dropoff_datetime"])
         return int(dt.timestamp() * 1000)
 
-config = Configuration()
-config.set_string("execution.checkpointing.dir", "file:///tmp/flink-checkpoints")
-config.set_string("execution.checkpointing.tolerable-failed-checkpoints", "5")
-config.set_string("restart-strategy.type", "fixed-delay")
-config.set_string("restart-strategy.fixed-delay.attempts", "3")
-config.set_string("restart-strategy.fixed-delay.delay", "10 s")
-env = StreamExecutionEnvironment.get_execution_environment(config)
-env.set_parallelism(1)
-env.enable_checkpointing(60_000)
-
-# --- KAFKA SOURCES & STREAMS ---
-
-pickup_source = KafkaSource.builder() \
-    .set_bootstrap_servers("kafka:9092") \
-    .set_topics("pickup_events") \
-    .set_starting_offsets(KafkaOffsetsInitializer.earliest()) \
-    .set_value_only_deserializer(SimpleStringSchema()) \
-    .set_group_id("pickup_consumer_group") \
-    .build()
-
-pickup_stream = env.from_source(
-    source=pickup_source,
-    watermark_strategy=WatermarkStrategy.no_watermarks(),
-    source_name="pickup_source"
-)
-
-parsed_pickups = pickup_stream.map(lambda text: json.loads(text))
-
-pickups_with_time = parsed_pickups.assign_timestamps_and_watermarks(
-    WatermarkStrategy
-        .for_bounded_out_of_orderness(Duration.of_seconds(30))
-        .with_timestamp_assigner(PickupTimestampAssigner())
-)
-
-dropoff_source = KafkaSource.builder() \
-    .set_bootstrap_servers("kafka:9092") \
-    .set_topics("dropoff_events") \
-    .set_starting_offsets(KafkaOffsetsInitializer.earliest()) \
-    .set_value_only_deserializer(SimpleStringSchema()) \
-    .set_group_id("dropoff_consumer_group") \
-    .build()
-
-dropoff_stream = env.from_source(
-    source=dropoff_source,
-    watermark_strategy=WatermarkStrategy.no_watermarks(),
-    source_name="dropoff_source"
-)
-
-parsed_dropoffs = dropoff_stream.map(lambda text: json.loads(text))
-
-dropoffs_with_time = parsed_dropoffs.assign_timestamps_and_watermarks(
-    WatermarkStrategy
-        .for_bounded_out_of_orderness(Duration.of_seconds(30))
-        .with_timestamp_assigner(DropoffTimestampAssigner())
-)
-
 # --- JOIN FUNCTION ---
-
-MAX_DURATION_SECONDS = 60 * 60 * 3
-TIMEOUT_SECONDS = 60 * 60 * 48
 
 class JoinTripsFunction(KeyedProcessFunction):
     def open(self, runtime_context: RuntimeContext):
@@ -232,13 +204,7 @@ class WindowStatsFunction(ProcessWindowFunction):
 
 class EnrichBoroughFunction(MapFunction):
     def open(self, runtime_context):
-        self.connection = psycopg2.connect(
-            host="postgres",
-            port=5432,
-            dbname="taxi",
-            user="taxi_user",   
-            password=os.getenv("DB_PASSWORD")
-        )
+        self.connection = connect_db()
         cursor = self.connection.cursor()
         cursor.execute("""SELECT location_id, borough FROM zones""")
         self.borough_by_zone = dict(cursor.fetchall())
@@ -364,13 +330,7 @@ class OpenTripsGaugeFunction(KeyedProcessFunction):
 
 class InvalidsSinkFunction(MapFunction):
     def open(self, runtime_context):
-        self.connection = psycopg2.connect(
-            host="postgres",
-            port=5432,
-            dbname="taxi",
-            user="taxi_user",
-            password=os.getenv("DB_PASSWORD")
-        )
+        self.connection = connect_db()
         self.cursor = self.connection.cursor()
 
     def map(self, row):
@@ -395,13 +355,7 @@ class InvalidsSinkFunction(MapFunction):
 
 class AggregatesSinkFunction(MapFunction):
     def open(self, runtime_context):
-        self.connection = psycopg2.connect(
-            host="postgres",
-            port=5432,
-            dbname="taxi",
-            user="taxi_user",
-            password=os.getenv("DB_PASSWORD")
-        )
+        self.connection = connect_db()
         self.cursor = self.connection.cursor()
 
     def map(self, row):
@@ -421,51 +375,108 @@ class AggregatesSinkFunction(MapFunction):
         if hasattr(self, 'connection') and self.connection:
             self.connection.close()
 
-# --- STREAM CONNECTION & EXECUTION ---
+# --- PIPELINE ---
 
-joined_trips = pickups_with_time.union(dropoffs_with_time) \
-    .key_by(lambda event: event["trip_id"]) \
-    .process(JoinTripsFunction())
+def create_environment():
+    """Configure Flink environment."""
+    config = Configuration()
+    config.set_string("restart-strategy.type", "fixed-delay")
+    config.set_string("restart-strategy.fixed-delay.attempts", "3")
+    config.set_string("restart-strategy.fixed-delay.delay", "10 s")
+    if CHECKPOINT_INTERVAL_MS > 0:
+        config.set_string("execution.checkpointing.dir", CHECKPOINT_DIR)
+        config.set_string(
+            "execution.checkpointing.tolerable-failed-checkpoints", "5")
+    env = StreamExecutionEnvironment.get_execution_environment(config)
+    env.set_parallelism(PARALLELISM)
+    if CHECKPOINT_INTERVAL_MS > 0:
+        env.enable_checkpointing(CHECKPOINT_INTERVAL_MS)
+    return env
 
-trips_only = joined_trips.filter(lambda r: r["record_type"] == "trip")
-lifecycle_signals = joined_trips.filter(lambda r: r["record_type"] == "lifecycle")
+def read_events(env, topic, group_id, timestamp_assigner):
+    """Read JSON events from Kafka topic and assign event-time watermarks."""
+    source = (
+        KafkaSource.builder()
+        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+        .set_topics(topic)
+        .set_starting_offsets(KafkaOffsetsInitializer.earliest())
+        .set_value_only_deserializer(SimpleStringSchema())
+        .set_group_id(group_id)
+        .build()
+    )
+    watermarks = (
+        WatermarkStrategy
+        .for_bounded_out_of_orderness(Duration.of_seconds(OUT_OF_ORDERNESS_SECONDS))
+        .with_timestamp_assigner(timestamp_assigner)
+    )
+    return (
+        env.from_source(
+            source=source,
+            watermark_strategy=WatermarkStrategy.no_watermarks(),
+            source_name=f"{topic}_source",
+        )
+        .map(lambda text: json.loads(text))
+        .assign_timestamps_and_watermarks(watermarks)
+    )
 
-# trips_only.map(lambda trip:   f"{'VALID' if trip['is_valid'] else 'INVALID'} "
-#    f"Trip {trip['trip_id']} from {trip['pickup_zone']} to {trip['dropoff_zone']} "
-#    f"took {trip['duration_seconds']/60 if trip['duration_seconds'] is not None else 'n/a'} min "
-#    f"for {trip['trip_distance']} miles "
-#    f"passengers: {trip['passenger_count']}, total amount: ${trip['total_amount']}") \
-#    .print()
+def add_time_of_day(trip):
+    """Attach time-of-day bucket of dropoff to trip."""
+    dropoff = datetime.fromisoformat(trip["dropoff_datetime"])
+    return {**trip, "time_of_day": dropoff_time_to_time_of_day(dropoff)}
 
-trips_only.filter(lambda trip: not trip["is_valid"]) \
-    .map(InvalidsSinkFunction())
+def dropoff_week_key(trip):
+    """Return ISO week of dropoff."""
+    dropoff = datetime.fromisoformat(trip["dropoff_datetime"])
+    return dropoff_time_to_week(dropoff)
 
-enriched_trips = trips_only.filter(lambda trip: trip["is_valid"]) \
-    .map(EnrichBoroughFunction()) \
-    .map(lambda trip: {**trip, "time_of_day": dropoff_time_to_time_of_day(datetime.fromisoformat(trip["dropoff_datetime"]))})
+def main():
+    """Build streaming pipeline and start Flink job."""
+    env = create_environment()
 
-enriched_trips.key_by(lambda trip: trip["dropoff_borough"]) \
-    .window(TumblingEventTimeWindows.of(Time.hours(24))) \
-    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(BOROUGH_METRICS)) \
-    .map(AggregatesSinkFunction())
+    pickups = read_events(env, PICKUP_TOPIC, "pickup_consumer_group", PickupTimestampAssigner())
+    dropoffs = read_events(env, DROPOFF_TOPIC, "dropoff_consumer_group", DropoffTimestampAssigner())
 
-enriched_trips.key_by(lambda trip: trip["time_of_day"]) \
-    .window(TumblingEventTimeWindows.of(Time.hours(24))) \
-    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(TIME_OF_DAY_METRICS)) \
-    .map(AggregatesSinkFunction())
+    joined_trips = (pickups.union(dropoffs)
+        .key_by(lambda event: event["trip_id"])
+        .process(JoinTripsFunction())
+    )
 
-enriched_trips.key_by(lambda trip: dropoff_time_to_week(datetime.fromisoformat(trip["dropoff_datetime"]))) \
-    .window(TumblingEventTimeWindows.of(Time.days(7), Time.days(4))) \
-    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(WEEKLY_METRICS)) \
-    .map(AggregatesSinkFunction())
+    trips_only = joined_trips.filter(lambda r: r["record_type"] == "trip")
+    lifecycle_signals = joined_trips.filter(lambda r: r["record_type"] == "lifecycle")
 
-enriched_trips.key_by(lambda t: "all") \
-    .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(5))) \
-    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(LAST_HOUR_METRICS)) \
-    .map(AggregatesSinkFunction())
+    (trips_only.filter(lambda trip: not trip["is_valid"])
+        .map(InvalidsSinkFunction()))
 
-lifecycle_signals.key_by(lambda x: "all") \
-    .process(OpenTripsGaugeFunction()) \
-    .map(AggregatesSinkFunction())
+    enriched_trips = (trips_only.filter(lambda trip: trip["is_valid"])
+        .map(EnrichBoroughFunction())
+        .map(add_time_of_day)
+    )
 
-env.execute("Taxi Flink Streaming Job")
+    (enriched_trips.key_by(lambda trip: trip["dropoff_borough"])
+        .window(TumblingEventTimeWindows.of(Time.hours(24)))
+        .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(BOROUGH_METRICS))
+        .map(AggregatesSinkFunction()))
+
+    (enriched_trips.key_by(lambda trip: trip["time_of_day"])
+        .window(TumblingEventTimeWindows.of(Time.hours(24)))
+        .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(TIME_OF_DAY_METRICS))
+        .map(AggregatesSinkFunction()))
+
+    (enriched_trips.key_by(dropoff_week_key)
+        .window(TumblingEventTimeWindows.of(Time.days(7), Time.days(4)))
+        .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(WEEKLY_METRICS))
+        .map(AggregatesSinkFunction()))
+
+    (enriched_trips.key_by(lambda trip: "all")
+        .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(LAST_HOUR_SLIDE_MINUTES)))
+        .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(LAST_HOUR_METRICS))
+        .map(AggregatesSinkFunction()))
+
+    (lifecycle_signals.key_by(lambda signal: "all")
+        .process(OpenTripsGaugeFunction())
+        .map(AggregatesSinkFunction()))
+    
+    env.execute("Taxi Flink Streaming Job")
+
+if __name__ == "__main__":
+    main()

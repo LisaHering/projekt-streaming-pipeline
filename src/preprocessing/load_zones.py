@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 
 csv_path = "/Users/lisa/Dokumente/nyc_taxi_2022_01/taxi_zone_lookup.csv"
-zones = pd.read_csv(csv_path)
+zones = pd.read_csv(csv_path, keep_default_na=False)
 load_dotenv()
 
 zones = zones.rename(columns={
