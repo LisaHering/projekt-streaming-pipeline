@@ -4,9 +4,10 @@ from pyflink.datastream.functions import MapFunction, AggregateFunction
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.datastream.window import TumblingEventTimeWindows, SlidingEventTimeWindows
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common import WatermarkStrategy, Duration, Time
+from pyflink.common import WatermarkStrategy, Duration, Time, Configuration
 from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.common.typeinfo import Types
+from typing import NamedTuple
 from datetime import datetime
 import json
 import psycopg2
@@ -17,14 +18,21 @@ class PickupTimestampAssigner(TimestampAssigner):
         dt = datetime.fromisoformat(event["pickup_datetime"])
         return int(dt.timestamp() * 1000)
 
+
 class DropoffTimestampAssigner(TimestampAssigner):
     def extract_timestamp(self, event, record_timestamp):
         dt = datetime.fromisoformat(event["dropoff_datetime"])
         return int(dt.timestamp() * 1000)
 
-env = StreamExecutionEnvironment.get_execution_environment()
+config = Configuration()
+config.set_string("execution.checkpointing.dir", "file:///tmp/flink-checkpoints")
+config.set_string("execution.checkpointing.tolerable-failed-checkpoints", "5")
+config.set_string("restart-strategy.type", "fixed-delay")
+config.set_string("restart-strategy.fixed-delay.attempts", "3")
+config.set_string("restart-strategy.fixed-delay.delay", "10 s")
+env = StreamExecutionEnvironment.get_execution_environment(config)
 env.set_parallelism(1)
-# env.enable_checkpointing(60_000)
+env.enable_checkpointing(60_000)
 
 # --- KAFKA SOURCES & STREAMS ---
 
@@ -172,6 +180,7 @@ class JoinTripsFunction(KeyedProcessFunction):
             "total_amount": event.get("total_amount"),
             "is_valid": False
         }
+    
 # --- INCREMENTAL AGGREGATION ---
 
 class TripStatsAggregate(AggregateFunction):
@@ -189,6 +198,35 @@ class TripStatsAggregate(AggregateFunction):
     
     def merge(self, a, b):
         return (a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3])
+
+
+class TripStats(NamedTuple):
+    """Readable view on accumulator of TripStatsAggregate."""
+
+    count: int
+    passengers: float
+    distance: float
+    revenue: float
+
+class WindowStatsFunction(ProcessWindowFunction):
+    """Turns pre-aggregated result of one window into metric rows."""
+
+    def __init__(self, metrics):
+        super().__init__()
+        self.metrics = metrics
+
+    def process(self, key, context, elements):
+        stats = TripStats(*next(iter(elements)))
+        window_start = datetime.fromtimestamp(context.window().start / 1000)
+        window_end = datetime.fromtimestamp(context.window().end / 1000)
+        for metric_name, compute in self.metrics.items():
+            yield {
+                "metric_name": metric_name, 
+                "window_start": window_start,
+                "window_end": window_end, 
+                "dimension": key, 
+                "value": compute(stats)
+            }
     
 # --- AGGREGATION 1: STATISTICS BY BOROUGHS ---
 
@@ -214,17 +252,11 @@ class EnrichBoroughFunction(MapFunction):
         row["dropoff_borough"] = self.borough_by_zone.get(row["dropoff_zone"], "Unknown")
         return row
 
-class BoroughStatsFunction(ProcessWindowFunction):
-    def process(self, key, context, elements):
-        count, passengers, distance, revenue = next(iter(elements))
-        window_start = datetime.fromtimestamp(context.window().start / 1000)
-        window_end = datetime.fromtimestamp(context.window().end / 1000)
-        yield {"metric_name": "trip_count_by_borough", "window_start": window_start,
-               "window_end": window_end, "dimension": key, "value": count}
-        yield {"metric_name": "avg_passengers_by_borough", "window_start": window_start,
-               "window_end": window_end, "dimension": key, "value": passengers / count}
-        yield {"metric_name": "avg_distance_by_borough", "window_start": window_start,
-               "window_end": window_end, "dimension": key, "value": distance / count}
+BOROUGH_METRICS = {
+    "trip_count_by_borough": lambda s: s.count,
+    "avg_passengers_by_borough": lambda s: s.passengers / s.count,
+    "avg_distance_by_borough": lambda s: s.distance / s.count,
+}
 
 # --- AGGREGATION 2: STATISTICS BY TIME OF DAY ---
 
@@ -241,17 +273,11 @@ def dropoff_time_to_time_of_day(dt):
     else:
         return "night"
 
-class TimeOfDayStatsFunction(ProcessWindowFunction):        
-    def process(self, key, context, elements):
-        count, passengers, distance, revenue = next(iter(elements))
-        window_start = datetime.fromtimestamp(context.window().start / 1000)
-        window_end = datetime.fromtimestamp(context.window().end / 1000)
-        yield {"metric_name": "trip_count_by_time_of_day", "window_start": window_start,
-               "window_end": window_end, "dimension": key, "value": count}
-        yield {"metric_name": "avg_passengers_by_time_of_day", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": passengers / count}
-        yield {"metric_name": "avg_distance_by_time_of_day", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": distance / count}
+TIME_OF_DAY_METRICS = {
+    "trip_count_by_time_of_day": lambda s: s.count,
+    "avg_passengers_by_time_of_day": lambda s: s.passengers / s.count,
+    "avg_distance_by_time_of_day": lambda s: s.distance / s.count,
+}
 
 # --- AGGREGATION 3: WEEKLY TRIPS & REVENUE ---
 
@@ -259,32 +285,21 @@ def dropoff_time_to_week(dt):
     year, week, _ = dt.isocalendar()
     return f"{year}-W{week:02d}"
 
-class WeeklyStatsFunction(ProcessWindowFunction):
-     def process(self, key, context, elements):
-         count, passengers, distance, revenue = next(iter(elements))
-         revenue_per_mile = revenue / distance if distance > 0 else 0
-         window_start = datetime.fromtimestamp(context.window().start / 1000)
-         window_end = datetime.fromtimestamp(context.window().end / 1000)
-         yield {"metric_name": "trips_per_week", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": count}
-         yield {"metric_name": "revenue_by_week", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": revenue}
-         yield {"metric_name": "revenue_per_mile_by_week", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": revenue_per_mile}
+WEEKLY_METRICS = {
+    "trips_per_week": lambda s: s.count,
+    "revenue_by_week": lambda s: s.revenue,
+    "revenue_per_mile_by_week": (
+        lambda s: s.revenue / s.distance if s.distance > 0 else 0.0
+    ),
+}
 
 # --- AGGREGATION 4: REVENUE LAST HOUR ---
 
-class LastHourMovingFunction(ProcessWindowFunction):
-     def process(self, key, context, elements):
-         count, passengers, distance, revenue = next(iter(elements))
-         window_start = datetime.fromtimestamp(context.window().start / 1000)
-         window_end = datetime.fromtimestamp(context.window().end / 1000)
-         yield {"metric_name": "avg_price_last_h", "window_start": window_start,
-                "window_end": window_end, "dimension": key, "value": revenue / count}
-         yield {"metric_name": "revenue_last_h", "window_start": window_start,
-                         "window_end": window_end, "dimension": key, "value": revenue}
-         yield {"metric_name": "trips_last_h", "window_start": window_start,
-                         "window_end": window_end, "dimension": key, "value": count}
+LAST_HOUR_METRICS = {
+    "avg_price_last_h": lambda s: s.revenue / s.count,
+    "revenue_last_h": lambda s: s.revenue,
+    "trips_last_h": lambda s: s.count,
+}
 
 # --- AGGREGATION 5: UTILIZATION (TAXIS IN SERVICE) ---
 
@@ -377,6 +392,7 @@ class InvalidsSinkFunction(MapFunction):
         if hasattr(self, 'connection') and self.connection:
             self.connection.close()
 
+
 class AggregatesSinkFunction(MapFunction):
     def open(self, runtime_context):
         self.connection = psycopg2.connect(
@@ -414,12 +430,12 @@ joined_trips = pickups_with_time.union(dropoffs_with_time) \
 trips_only = joined_trips.filter(lambda r: r["record_type"] == "trip")
 lifecycle_signals = joined_trips.filter(lambda r: r["record_type"] == "lifecycle")
 
-trips_only.map(lambda trip:   f"{'VALID' if trip['is_valid'] else 'INVALID'} "
-    f"Trip {trip['trip_id']} from {trip['pickup_zone']} to {trip['dropoff_zone']} "
-    f"took {trip['duration_seconds']/60 if trip['duration_seconds'] is not None else 'n/a'} min "
-    f"for {trip['trip_distance']} miles "
-    f"passengers: {trip['passenger_count']}, total amount: ${trip['total_amount']}") \
-    .print()
+# trips_only.map(lambda trip:   f"{'VALID' if trip['is_valid'] else 'INVALID'} "
+#    f"Trip {trip['trip_id']} from {trip['pickup_zone']} to {trip['dropoff_zone']} "
+#    f"took {trip['duration_seconds']/60 if trip['duration_seconds'] is not None else 'n/a'} min "
+#    f"for {trip['trip_distance']} miles "
+#    f"passengers: {trip['passenger_count']}, total amount: ${trip['total_amount']}") \
+#    .print()
 
 trips_only.filter(lambda trip: not trip["is_valid"]) \
     .map(InvalidsSinkFunction())
@@ -430,22 +446,22 @@ enriched_trips = trips_only.filter(lambda trip: trip["is_valid"]) \
 
 enriched_trips.key_by(lambda trip: trip["dropoff_borough"]) \
     .window(TumblingEventTimeWindows.of(Time.hours(24))) \
-    .aggregate(TripStatsAggregate(), window_function=BoroughStatsFunction()) \
+    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(BOROUGH_METRICS)) \
     .map(AggregatesSinkFunction())
 
 enriched_trips.key_by(lambda trip: trip["time_of_day"]) \
     .window(TumblingEventTimeWindows.of(Time.hours(24))) \
-    .aggregate(TripStatsAggregate(), window_function=TimeOfDayStatsFunction()) \
+    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(TIME_OF_DAY_METRICS)) \
     .map(AggregatesSinkFunction())
 
 enriched_trips.key_by(lambda trip: dropoff_time_to_week(datetime.fromisoformat(trip["dropoff_datetime"]))) \
     .window(TumblingEventTimeWindows.of(Time.days(7), Time.days(4))) \
-    .aggregate(TripStatsAggregate(), window_function=WeeklyStatsFunction()) \
+    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(WEEKLY_METRICS)) \
     .map(AggregatesSinkFunction())
 
 enriched_trips.key_by(lambda t: "all") \
     .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(5))) \
-    .aggregate(TripStatsAggregate(), window_function=LastHourMovingFunction()) \
+    .aggregate(TripStatsAggregate(), window_function=WindowStatsFunction(LAST_HOUR_METRICS)) \
     .map(AggregatesSinkFunction())
 
 lifecycle_signals.key_by(lambda x: "all") \
