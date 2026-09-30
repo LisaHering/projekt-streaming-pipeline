@@ -70,6 +70,7 @@ services:
     environment:
       DB_PASSWORD: ${DB_PASSWORD}
       PYTHONUNBUFFERED: 1
+      CHECKPOINT_INTERVAL_MS: ${CHECKPOINT_INTERVAL_MS:-0}
     restart: on-failure
 volumes:
   postgres_data:
