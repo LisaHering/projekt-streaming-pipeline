@@ -296,16 +296,18 @@ class OpenTripsGaugeFunction(KeyedProcessFunction):
             self.timer_registered.update(True)
 
     def on_timer(self, timestamp, ctx):
-        ctx.timer_service().register_processing_time_timer(timestamp + 60000)
+        now = ctx.timer_service().current_processing_time()
+        ctx.timer_service().register_processing_time_timer(now + 60000)
         event_now = ctx.timer_service().current_watermark()
         if event_now <= 0:
             return
                 
         cutoff = event_now - GAUGE_WINDOW_SECONDS * 1000
+        dropoffs = dict(self.dropoffs.items())
         count = 0
         finished = []
         for trip_id , pickup_ms in list(self.pickups.items()):
-            dropoff_ms = self.dropoffs.get(trip_id)
+            dropoff_ms = dropoffs.get(trip_id)
             if (dropoff_ms is not None and dropoff_ms <= event_now) or pickup_ms < cutoff:
                 finished.append(trip_id)
             elif pickup_ms <= event_now:
