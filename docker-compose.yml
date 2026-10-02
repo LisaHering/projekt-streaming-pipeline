@@ -1,6 +1,7 @@
 services:
   kafka-init:
-    image: alpine
+    # Init container: Kafka gets ownership of its data volume before broker starts.
+    image: alpine:3.20
     container_name: kafka-init
     command: ["chown", "-R", "1000:1000", "/data"]
     volumes:
@@ -37,7 +38,8 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: taxi
     ports:
-      - "5432:5432"
+      # Reachable from host machine only, not from network
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -54,9 +56,13 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       DB_PASSWORD: ${DB_PASSWORD}
       PYTHONUNBUFFERED: 1
+    # One-off replay: prevent producer from sending all trips again
+    restart: "no"
   processing:
     build:
       context: .
@@ -70,7 +76,9 @@ services:
     environment:
       DB_PASSWORD: ${DB_PASSWORD}
       PYTHONUNBUFFERED: 1
-      CHECKPOINT_INTERVAL_MS: ${CHECKPOINT_INTERVAL_MS:-0}
+      # Checkpoint every 3 min; set to 0 in .env to disable
+      CHECKPOINT_INTERVAL_MS: ${CHECKPOINT_INTERVAL_MS:-180000}
+    # Replay topics from beginning on restart after crash
     restart: on-failure
 volumes:
   postgres_data:
