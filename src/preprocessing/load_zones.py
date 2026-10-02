@@ -8,9 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- CONFIGURATION ---
 # Override settings via environment variables
-
 DATA_DIR = os.getenv("DATA_DIR", "data")
 ZONES_FILE = os.getenv("ZONES_FILE", "taxi_zone_lookup.csv")
 
