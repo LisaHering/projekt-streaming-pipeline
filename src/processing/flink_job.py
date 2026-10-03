@@ -158,7 +158,7 @@ class JoinTripsFunction(KeyedProcessFunction):
             yield from self._handle_dropoff(event, ctx)
 
     def _handle_pickup(self, pickup, ctx):
-        """Store pickup, emit trip once dropoff is known."""
+        """Store pickup, if dropoff already arrived, emit trip via timer."""
         yield {
             "record_type": "lifecycle",
             "signal": "pickup",
@@ -212,6 +212,7 @@ class JoinTripsFunction(KeyedProcessFunction):
             self.dropoff_state.clear()
 
     def _build_trip(self, pickup, dropoff):
+        """Combine pickup and dropoff into one trip and check its duration."""
         pickup_dt = datetime.fromisoformat(pickup["pickup_datetime"])
         dropoff_dt = datetime.fromisoformat(dropoff["dropoff_datetime"])
         duration_seconds = (dropoff_dt - pickup_dt).total_seconds()
@@ -239,9 +240,9 @@ class JoinTripsFunction(KeyedProcessFunction):
     def _build_orphan(self, event):
         """Build invalid trip record for event without counterpart."""
         if "pickup_datetime" in event:
-            reason = "missing_dropoff"
+            invalid_reason = "missing_dropoff"
         else:
-            reason = "missing_pickup"
+            invalid_reason = "missing_pickup"
         return {
             "record_type": "trip",
             "trip_id": event["trip_id"],
@@ -254,7 +255,7 @@ class JoinTripsFunction(KeyedProcessFunction):
             "passenger_count": event.get("passenger_count"),
             "total_amount": event.get("total_amount"),
             "is_valid": False,
-            "invalid_reason": reason
+            "invalid_reason": invalid_reason
         }
 
 
@@ -631,9 +632,10 @@ def main():
                    window_function=WindowStatsFunction(TIME_OF_DAY_METRICS))
         .map(AggregatesSinkFunction()))
 
-    # Flink aligns windows to a Thursday (1970-01-01) -> 4 days offset (Monday)
     (enriched_trips
         .key_by(dropoff_week_key)
+        # Flink aligns windows to a Thursday (1970-01-01)
+        # -> 4 days offset shifts the start to Monday
         .window(TumblingEventTimeWindows.of(Time.days(7), Time.days(4)))
         .aggregate(TripStatsAggregate(),
                    window_function=WindowStatsFunction(WEEKLY_METRICS))
