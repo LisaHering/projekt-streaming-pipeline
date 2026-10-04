@@ -8,7 +8,6 @@ The pipeline is set up as Infrastructure as Code for seamless deployment and orc
 
 The project is part of my Machine Learning training at the IU Akademy (IU-Modul DLMDWWDE02: Projekt Data Engineering).
 
-
 ## ARCHITECTURE
 
 ```text
@@ -46,6 +45,21 @@ Producer (replays trips in event-time order)
                                                 PostgreSQL: aggregates
 ```
 
+| Service | Role |
+|---|---|
+| `postgres` | stores source data and results |
+| `producer` | replays trips as pickup and dropoff events |
+| `kafka-init` | prepares data volume for Kafka |
+| `kafka` | message broker with two topics |
+| `processing` | Flink job that validates, joins and aggregates |
+
+### Flink Job
+
+1. Read both topics and validate every message
+2. Join pickup and dropoff of the same trip by trip_id
+3. Check the trip duration, store implausible trips separately
+4. Add the borough and the time of day
+5. Aggregate in time windows and write 13 metrics to PostgreSQL
 
 ## PREREQUISITES
 
@@ -57,7 +71,7 @@ For the data download:
   - a free Google Cloud project
   - the Python package `pandas-gbq`
 
-Ports available: 5432 (used by PostgreSQL)
+Ports available: 5432 (used by PostgreSQL)  
 If it is already in use, change the left port number in `docker-compose.yml`, e.g. `"127.0.0.1:5433:5432"`, and set `DB_PORT=5433` in `.env` so the load scripts use the same port.
 
 
@@ -65,7 +79,7 @@ If it is already in use, change the left port number in `docker-compose.yml`, e.
 
 Original Source: New York City Taxi and Limousine Commission (TLC)
 
-Access: Mirrored by Google as BigQuery public dataset `bigquery-public-data.new_york_taxi_trips`
+Access: Mirrored by Google as BigQuery public dataset `bigquery-public-data.new_york_taxi_trips`  
 (Google account and Google Cloud project required)
 
 Period: 1-31 January 2022
@@ -90,16 +104,16 @@ After you have cloned the Git repository, created your virtual environment and s
 
 1. Copy `.env.example` to `.env` and provide path for your data directory, a password for PostgreSQL and your Google Cloud project ID.
 
-2. Download data (see GETTING THE DATA above).
-
-3. In order to start Kafka and PostgresSQL run:
-```bash
-    docker compose up -d kafka postgres
-```
-
-4. Install requirements:
+2. Install requirements:
 ```bash
     pip install -r requirements.txt
+```
+
+3. Download data (see GETTING THE DATA above).
+
+4. In order to start Kafka and PostgreSQL run:
+```bash
+    docker compose up -d kafka postgres
 ```
 
 5. Load data (in this order):
@@ -117,7 +131,7 @@ After you have cloned the Git repository, created your virtual environment and s
 ```bash
     docker compose exec postgres psql -U taxi_user -d taxi -c "SELECT count(*), max(window_end) FROM aggregates WHERE metric_name = 'trips_last_h';"
 ```
-After a few minutes both values start to grow, for example `43 | 2022-01-01 03:35:00` (hours processed | current time stamp). Run the query again to see the progress.
+After a few minutes both values start to grow, for example `43 | 2022-01-01 03:35:00` (number of windows written | end of the latest window). Run the query again to see the progress.  
 The run is complete when it shows `8927 | 2022-01-31 23:55:00`.
 
 Runtimes: Producer about 3.5 h, processing about 10 h
@@ -210,8 +224,8 @@ These are constants at the top of `flink_job.py`.
 
 ## RUNNING AGAIN
 
-Never run `docker compose down -v`: it deletes all volumes, including the loaded trips in PostgreSQL, so the data would have to be loaded again.
-It is necessary to delete the Kafka topics to rerun (step 2), since the producer refuses to run as long as there are still messages in the topics in order to prevent the ingestion of the same messages a second time, 
+Never run `docker compose down -v`: it deletes all volumes, including the loaded trips in PostgreSQL, so the data would have to be loaded again.  
+It is necessary to delete the Kafka topics to rerun (step 2): The producer refuses to run as long as there are still messages in the topics in order to prevent the ingestion of the same messages a second time.
 
 1. Stop producer and Flink job:
 ```bash
@@ -225,14 +239,14 @@ It is necessary to delete the Kafka topics to rerun (step 2), since the producer
     docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic pickup_events --partitions 1 --replication-factor 1
    docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic dropoff_events --partitions 1 --replication-factor 1
 ```
-    If creating fails with "already exists", wait a few seconds and repeat.
+If creating fails with "already exists", wait a few seconds and repeat.
 
 3. Truncate the result tables:
 ```bash
     docker compose exec postgres psql -U taxi_user -d taxi -c "TRUNCATE aggregates, invalid_trips, rejected_events;"
 ```
 
-4. 4. Start producer and Flink job with fresh containers:
+4. Start producer and Flink job with fresh containers:
 ```bash
    docker compose up -d --force-recreate --no-deps producer processing
 ```
@@ -240,52 +254,28 @@ It is necessary to delete the Kafka topics to rerun (step 2), since the producer
 
 ## DESIGN DECISIONS
 
-- **Event time instead of processing time.** Windows use the timestamps in
-  the events, tracked by watermarks. Results do not depend on how fast the
-  data is replayed; three full runs produced identical counts.
-- **Stateful join.** Pickup and dropoff events arrive in separate topics and
-  are joined by `trip_id` with keyed state and event-time timers. Trips whose
-  counterpart is still missing after 48 hours are stored as invalid.
-- **Unique trip IDs.** The producer assigns a UUID to every trip, so IDs
-  cannot collide after a restart.
-- **Incremental aggregation.** Each window keeps four running sums instead of
-  all its trips, so memory per window stays constant.
-- **Two-stage validation.** Unreadable or incomplete messages go to
-  `rejected_events` right after reading; trips that are implausible as a
-  whole (duration) go to `invalid_trips` after the join. A single bad message
-  cannot stop the job.
-- **Idempotent sinks with replay.** After a container restart Flink reads the
-  topics from the beginning. All inserts use `ON CONFLICT`, so repeated
-  records overwrite or skip existing rows instead of duplicating them.
-- **Checkpoints.** Flink saves its state every three minutes and resumes from
-  the last checkpoint after an internal failure.
-- **Data security and protection.** The password is only stored in `.env`,
-  PostgreSQL is reachable from localhost only, Kafka is not exposed, and only
-  the seven columns needed are downloaded. The data contains no personal
-  information.
+- **Event time instead of processing time.** Windows use the timestamps in the events, tracked by watermarks. Results do not depend on how fast the data is replayed; three full runs produced identical counts.
+- **Accelerated replay.** The producer sends the events 600 times faster than real time and caps pauses at 30 seconds, so a month is replayed in a few hours. Because the Flink job works with event time, the speed does not change the results.
+- **Unique trip IDs.** The producer assigns a UUID to every trip, so IDs cannot collide after a restart.
+- **Checkpoints.** Flink saves its state every three minutes and resumes from the last checkpoint after an internal failure.
+- **Stateful join.** Pickup and dropoff events arrive in separate topics and are joined by `trip_id` with keyed state and event-time timers. Trips whose counterpart is still missing after 48 hours are stored as invalid.
+- **Incremental aggregation.** Each window keeps four running sums instead of all its trips, so memory per window stays constant.
+- **Validation at three points.** The load script removes rows with missing values, wrong time order, non-positive distance or amount, an invalid passenger count or an unknown zone (2,302,150 of 2,463,900 rows are loaded). The Flink job validates again, because a stream cannot be trusted: unreadable or incomplete messages go to `rejected_events` right after reading; trips that are implausible as a whole (duration) go to `invalid_trips` after the join. A single bad message cannot stop the job.
+- **Idempotent sinks with replay.** After a container restart Flink reads the topics from the beginning. All inserts use `ON CONFLICT`, so repeated records overwrite or skip existing rows instead of duplicating them.
+- **Data security and protection.** The password is only stored in `.env`, PostgreSQL is reachable from localhost only, Kafka is not exposed, and only the seven columns needed are downloaded. The data contains no personal information.
 
 
 ## LIMITATIONS
 
-- **Finite data set.** The last windows of the month never close, because no
-  later event advances the watermark. A continuous stream would not have this
-  effect.
-- **Producer cannot resume.** If the producer stops halfway, the topics must
-  be deleted and the replay started again (see RUNNING AGAIN).
-- **Kafka retention.** Kafka keeps events for seven days (default). A replay
-  from the beginning is only complete within that period.
-- **Checkpoints are stored inside the container.** They survive internal
-  restarts of the job, but not a recreated container.
-- **Very long trips.** Trips longer than 48 hours are reported as
-  `missing_dropoff` instead of `duration_over_3h` (3 trips in January 2022).
-- **Not scaled out.** One Kafka partition, parallelism 1, a single broker.
-  Raising `PARALLELISM` alone is not enough; more partitions and an adapted
-  watermark strategy would be needed.
-- **Late events.** Events arriving more than 30 seconds out of order are not
-  counted in windows that are already closed.
-- **Throughput.** Each result row is committed separately, and the open-trips
-  gauge scans all open trips once per minute. The full month takes about ten
-  hours on a laptop.
+- **Finite data set.** The last windows of the month never close, because no later event advances the watermark. A continuous stream would not have this effect.
+- **Producer cannot resume.** If the producer stops halfway, the topics must be deleted and the replay started again (see RUNNING AGAIN).
+- **Replay from the beginning.** After a container restart the job reads the topics from the start. This works for a finite data set, but not for an endless stream: catching up takes longer and longer, and Kafka deletes events after seven days (default). A production setup would need to store checkpoints outside the container and resume from the last one.
+- **Checkpoints are stored inside the container.** They survive internal restarts of the job, but not a recreated container.
+- **Very long trips.** Trips longer than 48 hours are reported as `missing_dropoff` instead of `duration_over_3h` (3 trips in January 2022).
+- **Not scaled out.** One Kafka partition, parallelism 1, a single broker. Raising `PARALLELISM` alone is not enough; more partitions and an adapted watermark strategy would be needed.
+- **Late events.** Events arriving more than 30 seconds out of order are not counted in windows that are already closed.
+- **Throughput.** Each result row is committed separately, and the open-trips gauge scans all open trips once per minute. The full month takes about ten hours on a laptop.
+- **Single PostgreSQL instance.** It serves as source and sink and fitsthe small, structured results. For much higher volumes a store built for time series or analytics would scale better.
 
 
 ## PROJECT STRUCTURE
