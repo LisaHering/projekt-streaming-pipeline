@@ -74,6 +74,8 @@ For the data download:
 Ports available: 5432 (used by PostgreSQL)  
 If it is already in use, change the left port number in `docker-compose.yml`, e.g. `"127.0.0.1:5433:5432"`, and set `DB_PORT=5433` in `.env` so the load scripts use the same port.
 
+Developed and tested on macOS (Intel) with Docker Desktop. The containers run on Windows and Linux as well. On ARM machines (e.g. Apple Silicon) the Flink container runs emulated via `platform: linux/amd64` and is slower.
+
 
 ## GETTING THE DATA
 
@@ -88,7 +90,7 @@ Columns: `pickup_datetime`, `dropoff_datetime`, `passenger_count`, `trip_distanc
 
 In order to download the trips data, install `pandas-gbq` and run `download_trips.py`:
 ```bash
-    pip install pandas-gbq
+    pip install --only-binary cryptography pandas-gbq
     python src/preprocessing/download_trips.py
 ```
 (on first run a browser window asks for authorization)
@@ -100,7 +102,13 @@ The `taxi_zone_lookup.csv` is included in the repository in `data/` (source TLC)
 
 ## QUICK START
 
-After you have cloned the Git repository, created your virtual environment and started Docker Desktop:
+A separate Python environment is recommended, for example with conda:
+
+```bash
+conda create -n taxi-pipeline python=3.11
+conda activate taxi-pipeline
+```
+After you have cloned the Git repository, created your Python environment and started Docker Desktop:
 
 1. Copy `.env.example` to `.env` and provide path for your data directory, a password for PostgreSQL and your Google Cloud project ID.
 

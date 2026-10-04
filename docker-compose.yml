@@ -68,6 +68,7 @@ services:
       context: .
       dockerfile: src/processing/Dockerfile
     container_name: processing
+    platfrom: linux/amd64
     depends_on:
       kafka:
         condition: service_healthy
