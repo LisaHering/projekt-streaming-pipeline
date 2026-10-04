@@ -1,0 +1,5 @@
+pytest
+apache-flink==2.0.0
+pandas
+psycopg2-binary
+python-dotenv

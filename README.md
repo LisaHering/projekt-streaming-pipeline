@@ -74,7 +74,7 @@ For the data download:
 Ports available: 5432 (used by PostgreSQL)  
 If it is already in use, change the left port number in `docker-compose.yml`, e.g. `"127.0.0.1:5433:5432"`, and set `DB_PORT=5433` in `.env` so the load scripts use the same port.
 
-Developed and tested on macOS (Intel) with Docker Desktop. The containers run on Windows and Linux as well. On ARM machines (e.g. Apple Silicon) the Flink container runs emulated via `platform: linux/amd64` and is slower.
+Developed and tested on macOS (Intel) with Docker Desktop.
 
 
 ## GETTING THE DATA
@@ -245,7 +245,7 @@ It is necessary to delete the Kafka topics to rerun (step 2): The producer refus
     docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic pickup_events
     docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic dropoff_events
     docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic pickup_events --partitions 1 --replication-factor 1
-   docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic dropoff_events --partitions 1 --replication-factor 1
+    docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic dropoff_events --partitions 1 --replication-factor 1
 ```
 If creating fails with "already exists", wait a few seconds and repeat.
 
@@ -293,6 +293,8 @@ projekt-streaming-pipeline/
 ├── docker-compose.yml        # defines and connects all services
 ├── .env.example              # template for passwords and local settings
 ├── requirements.txt          # Python packages for producer and load scripts
+├── requirements-dev.txt      # Python packages for the unit tests
+├── pytest.ini                # tells pytest where the modules are
 ├── README.md
 ├── data/
 │   └── taxi_zone_lookup.csv  # zone lookup table (trip CSVs are not in Git)
@@ -313,9 +315,18 @@ projekt-streaming-pipeline/
 │       ├── requirements.txt
 │       └── flink_job.py
 └── tests/                    # unit tests
+    ├── test_flink_job.py
+    └── test_load_trips.py
 ```
 Unlike a single Python package, this project consists of two independent microservices. Each service has its own entry point (`producer.py`, `flink_job.py`) and its own Dockerfile, and `docker-compose.yml` is the entry point of the system as a whole. The services do not import code from each other; they communicate only through Kafka and PostgreSQL. For this reason there is no `main.py`, `setup.py` or `__init__.py` in the project root.
 
 
 ## TESTS
 
+The unit tests cover the validation and business rules (event validation, trip duration, time-of-day buckets, ISO week, load script rules). They run without Kafka, Flink cluster or database. PyFlink needs older versions of some packages than the download script, so use a separate environment:
+```bash
+    conda create -n taxi-tests python=3.11
+    conda activate taxi-tests
+    pip install -r requirements-dev.txt
+    pytest -v
+```
