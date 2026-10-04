@@ -74,7 +74,7 @@ For the data download:
 Ports available: 5432 (used by PostgreSQL)  
 If it is already in use, change the left port number in `docker-compose.yml`, e.g. `"127.0.0.1:5433:5432"`, and set `DB_PORT=5433` in `.env` so the load scripts use the same port.
 
-Developed and tested on macOS (Intel) with Docker Desktop.
+Developed and tested on macOS (Intel) with Docker Desktop. The setting `platform: linux/amd64` of the Flink service is meant for ARM machines (e.g. Apple Silicon) and is untested.
 
 
 ## GETTING THE DATA
@@ -126,7 +126,7 @@ After you have cloned the Git repository, created your Python environment and st
 
 5. Load data (in this order):
 ```bash
-    python src/preprocessing/load_zones.py 
+    python src/preprocessing/load_zones.py
     python src/preprocessing/load_trips.py
 ```
 
@@ -142,7 +142,7 @@ After you have cloned the Git repository, created your Python environment and st
 After a few minutes both values start to grow, for example `43 | 2022-01-01 03:35:00` (number of windows written | end of the latest window). Run the query again to see the progress.  
 The run is complete when it shows `8927 | 2022-01-31 23:55:00`.
 
-Runtimes: Producer about 3.5 h, processing about 10 h
+Runtimes: loading the trips about 2 h, producer 2 to 3.5 h, processing about 10 h
 
 
 ## VIEWING THE RESULTS
@@ -187,9 +187,7 @@ SELECT invalid_reason, count(*) FROM invalid_trips GROUP BY 1;
 SELECT topic, reason, raw_payload FROM rejected_events;
 ```
 
-Result of the full run (2,302,150 trips): the daily windows contain
-2,219,877 valid trips and `invalid_trips` contains 2,737 trips. Both numbers
-are identical to a reference query on the source table `raw_trips`.
+Result of the full run (2,302,150 trips): the daily windows up to 30 January contain 2,219,877 valid trips and `invalid_trips` contains 2,737 trips. Both numbers are identical to a reference query on the source table `raw_trips`. The window of 31 January is never written (see LIMITATIONS).
 
 
 ## CONFIGURATION
@@ -262,7 +260,7 @@ If creating fails with "already exists", wait a few seconds and repeat.
 
 ## DESIGN DECISIONS
 
-- **Event time instead of processing time.** Windows use the timestamps in the events, tracked by watermarks. Results do not depend on how fast the data is replayed; three full runs produced identical counts.
+- **Event time instead of processing time.** Windows use the timestamps in the events, tracked by watermarks. Results do not depend on how fast the data is replayed; three full runs produced identical counts of valid trips.
 - **Accelerated replay.** The producer sends the events 600 times faster than real time and caps pauses at 30 seconds, so a month is replayed in a few hours. Because the Flink job works with event time, the speed does not change the results.
 - **Unique trip IDs.** The producer assigns a UUID to every trip, so IDs cannot collide after a restart.
 - **Checkpoints.** Flink saves its state every three minutes and resumes from the last checkpoint after an internal failure.
@@ -283,7 +281,7 @@ If creating fails with "already exists", wait a few seconds and repeat.
 - **Not scaled out.** One Kafka partition, parallelism 1, a single broker. Raising `PARALLELISM` alone is not enough; more partitions and an adapted watermark strategy would be needed.
 - **Late events.** Events arriving more than 30 seconds out of order are not counted in windows that are already closed.
 - **Throughput.** Each result row is committed separately, and the open-trips gauge scans all open trips once per minute. The full month takes about ten hours on a laptop.
-- **Single PostgreSQL instance.** It serves as source and sink and fitsthe small, structured results. For much higher volumes a store built for time series or analytics would scale better.
+- **Single PostgreSQL instance.** It serves as source and sink and fits the small, structured results. For much higher volumes a store built for time series or analytics would scale better.
 
 
 ## PROJECT STRUCTURE
@@ -300,8 +298,6 @@ projekt-streaming-pipeline/
 │   └── taxi_zone_lookup.csv  # zone lookup table (trip CSVs are not in Git)
 ├── db/
 │   └── init.sql              # creates all tables on first start
-├── docs/
-│   └── checkpoint_analysis_log.txt
 ├── src/
 │   ├── preprocessing/        # one-off scripts, run on the host
 │   │   ├── download_trips.py
@@ -323,10 +319,21 @@ Unlike a single Python package, this project consists of two independent microse
 
 ## TESTS
 
-The unit tests cover the validation and business rules (event validation, trip duration, time-of-day buckets, ISO week, load script rules). They run without Kafka, Flink cluster or database. PyFlink needs older versions of some packages than the download script, so use a separate environment:
+The unit tests cover the validation and business rules:
+- event validation
+- dead-letter logic
+- 3-hour duration limit (including boundary values)
+- time-of-day buckets
+- ISO week
+- validation rules of the load script
+
+These can be tested in isolation and run without Kafka, Flink cluster or database.  
+PyFlink needs older versions of some packages than the download script, so use a separate environment:
 ```bash
     conda create -n taxi-tests python=3.11
     conda activate taxi-tests
     pip install -r requirements-dev.txt
     pytest -v
 ```
+
+The stateful join, the event-time windows and the database sinks are not covered by unit tests, because they need a running Flink job. They can be verified end-to-end instead: after the full replay, the results in PostgreSQL were compared with SQL reference queries on `raw_trips`.
